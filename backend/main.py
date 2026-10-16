@@ -7,11 +7,12 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
+import ai_service
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SAPNA_SAATHI_DB", str(BASE_DIR / "sapna_saathi.db")))
@@ -85,6 +86,58 @@ class DocumentProgress(BaseModel):
             raise ValueError("checked contains an unknown document id")
         return value
 
+class AssistantContext(BaseModel):
+    class Config:
+        extra = "forbid"
+    class_level: str = Field(default="", max_length=80)
+    course: str = Field(default="", max_length=100)
+    rural: bool | None = None
+    completed_documents: list[str] = Field(default_factory=list)
+
+    @validator("completed_documents")
+    def validate_completed_documents(cls, value: list[str]) -> list[str]:
+        if len(value) > len(DOCUMENT_IDS) or any(item not in DOCUMENT_IDS for item in value):
+            raise ValueError("completed_documents contains invalid document ids")
+        return value
+
+class ChatMessage(BaseModel):
+    class Config:
+        extra = "forbid"
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=1000)
+
+class ChatRequest(BaseModel):
+    class Config:
+        extra = "forbid"
+    question: str = Field(min_length=1, max_length=1500)
+    context: AssistantContext = Field(default_factory=AssistantContext)
+    history: list[ChatMessage] = Field(default_factory=list)
+
+    @validator("question")
+    def validate_question(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("question must not be blank")
+        return value
+
+    @validator("history")
+    def validate_history(cls, value: list[ChatMessage]) -> list[ChatMessage]:
+        if len(value) > 8:
+            raise ValueError("history may contain at most eight messages")
+        return value
+
+class GuidanceRequest(BaseModel):
+    class Config:
+        extra = "forbid"
+    document_id: str
+    context: AssistantContext = Field(default_factory=AssistantContext)
+
+    @validator("document_id")
+    def validate_document_id(cls, value: str) -> str:
+        if value not in ai_service.DOCUMENT_GUIDANCE:
+            raise ValueError("unknown document id")
+        return value
+
 @contextmanager
 def connection() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +156,12 @@ def initialize_db() -> None:
 
 initialize_db()
 app = FastAPI(title="Sapna Saathi Demo API", version="1.0.0", description="Local demo only. Scholarship data and eligibility rules are illustrative, not official.")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["GET", "POST", "PUT", "OPTIONS"], allow_headers=["*"])
+CORS_ORIGINS = [origin.strip().rstrip("/") for origin in os.getenv("SAPNA_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET", "POST", "PUT", "OPTIONS"], allow_headers=["*"])
+
+@app.on_event("startup")
+async def log_ai_provider_configuration() -> None:
+    ai_service.log_provider_key_status("API startup")
 
 def validate_student_id(student_id: str) -> None:
     if not STUDENT_ID_RE.fullmatch(student_id):
@@ -136,6 +194,16 @@ def check_eligibility(request: EligibilityRequest) -> list[dict[str, object]]:
     if len(ids) != len(set(ids)):
         raise HTTPException(status_code=400, detail="opportunity_ids must not contain duplicates")
     return [{"opportunity_id": item_id, "eligible": evaluate(request.profile, item_id)[0], "reason": evaluate(request.profile, item_id)[1], "is_mock": True} for item_id in ids]
+
+@app.post("/api/assistant/chat")
+async def assistant_chat(request: ChatRequest) -> dict[str, str]:
+    context = request.context.dict()
+    history = [message.dict() for message in request.history]
+    return await ai_service.chat(request.question, history, context)
+
+@app.post("/api/assistant/guidance")
+async def assistant_guidance(request: GuidanceRequest) -> dict[str, str]:
+    return await ai_service.guidance(request.document_id, request.context.dict())
 
 @app.get("/api/profile/{student_id}")
 def get_profile(student_id: str) -> dict[str, object]:
