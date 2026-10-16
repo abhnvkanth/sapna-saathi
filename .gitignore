@@ -2,6 +2,12 @@
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
+backend/*.db
+backend/*.sqlite*
+backend/__pycache__/
+backend/.venv/
+backend/venv/
+*.py[cod]
 
 # Local environment and credentials
 .env
@@ -14,3 +20,4 @@ frontend/*.tsbuildinfo
 .DS_Store
 Thumbs.db
 .vscode/
+backend/.python-user/
